@@ -25,7 +25,6 @@ jobs:
             p/security-audit
             p/nodejs
             p/owasp-top-ten
-          generateSarif: "1"
         env:
           SEMGREP_REPO_NAME: ${{ github.repository }}
 
@@ -72,6 +71,7 @@ jobs:
       - name: Run Trivy Vulnerability Scanner (Container)
         uses: aquasecurity/trivy-action@master
         with:
+          version: 'latest'
           image-ref: 'nodegoat:ci'
           format: 'json'
           output: 'trivy-container.json'
@@ -81,6 +81,7 @@ jobs:
       - name: Run Trivy IaC Scanner (Kubernetes)
         uses: aquasecurity/trivy-action@master
         with:
+          version: 'latest'
           scan-type: 'config'
           scan-ref: 'k8s/'
           format: 'json'
