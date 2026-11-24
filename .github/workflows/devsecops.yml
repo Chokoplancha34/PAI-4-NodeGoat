@@ -1,0 +1,220 @@
+name: DevSecOps Pipeline - OWASP NodeGoat
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  # ==========================================
+  # FASE 1: SAST (Semgrep) y SCA (Dependency-Check)
+  # ==========================================
+  sast-sca:
+    name: SAST & SCA Analysis
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run Semgrep SAST
+        uses: returntocorp/semgrep-action@v1
+        with:
+          config: >-
+            p/security-audit
+            p/nodejs
+            p/owasp-top-ten
+          generateSarif: "1"
+        env:
+          SEMGREP_REPO_NAME: ${{ github.repository }}
+
+      - name: Export Semgrep JSON Report
+        run: |
+          pip install semgrep
+          semgrep --config p/security-audit --config p/nodejs --json -o semgrep.json . || true
+
+      - name: Run OWASP Dependency-Check (SCA)
+        uses: dependency-check/Dependency-Check_Action@main
+        with:
+          project: 'OWASP-NodeGoat'
+          path: '.'
+          format: 'XML'
+          out: 'reports'
+          args: >
+            --failOnCVSS 11
+            --suppression suppression.xml || true
+        continue-on-error: true
+
+      - name: Upload SAST & SCA Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: sast-sca-reports
+          path: |
+            semgrep.json
+            reports/dependency-check-report.xml
+          if-no-files-found: warn
+
+  # ==========================================
+  # FASE 2: Build Docker & Trivy (Container + IaC)
+  # ==========================================
+  container-iac-scan:
+    name: Container & IaC Security (Trivy)
+    runs-on: ubuntu-latest
+    needs: sast-sca
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build NodeGoat Docker Image
+        run: docker build -t nodegoat:ci .
+
+      - name: Run Trivy Vulnerability Scanner (Container)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: 'nodegoat:ci'
+          format: 'json'
+          output: 'trivy-container.json'
+          severity: 'CRITICAL,HIGH,MEDIUM,LOW'
+          exit-code: '0'
+
+      - name: Run Trivy IaC Scanner (Kubernetes)
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'config'
+          scan-ref: 'k8s/'
+          format: 'json'
+          output: 'trivy-iac.json'
+          exit-code: '0'
+
+      - name: Upload Trivy Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-reports
+          path: |
+            trivy-container.json
+            trivy-iac.json
+
+  # ==========================================
+  # FASE 3: DAST (OWASP ZAP Baseline Scan)
+  # ==========================================
+  dast-scan:
+    name: DAST Analysis (OWASP ZAP)
+    runs-on: ubuntu-latest
+    needs: container-iac-scan
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Start NodeGoat Stack (App + MongoDB)
+        run: |
+          docker compose up -d
+          echo "Esperando a que NodeGoat arranque en el puerto 4000..."
+          for i in {1..30}; do
+            if curl -s http://localhost:4000 > /dev/null; then
+              echo "NodeGoat activo!"
+              break
+            fi
+            sleep 2
+          done
+
+      - name: Run OWASP ZAP Baseline Scan
+        uses: zaproxy/action-baseline@v0.12.0
+        with:
+          target: 'http://localhost:4000'
+          rules_file_name: '.zap/rules.tsv'
+          cmd_options: '-a -x zap-report.xml'
+          allow_issue_writing: false
+        continue-on-error: true
+
+      - name: Stop NodeGoat Stack
+        if: always()
+        run: docker compose down
+
+      - name: Upload DAST Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dast-reports
+          path: zap-report.xml
+          if-no-files-found: warn
+
+  # ==========================================
+  # FASE 4: Ingesta Centralizada en DefectDojo
+  # ==========================================
+  defectdojo-import:
+    name: Upload Reports to DefectDojo
+    runs-on: ubuntu-latest
+    needs: [sast-sca, container-iac-scan, dast-scan]
+    if: always()
+    steps:
+      - name: Download All Scan Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: all-reports
+
+      - name: Check DefectDojo Tunnel Availability
+        id: check_dd
+        run: |
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" "${{ secrets.DEFECTDOJO_URL }}/api/v2/" -H "Authorization: Token ${{ secrets.DEFECTDOJO_TOKEN }}" || echo "000")
+          echo "HTTP Status DefectDojo: $STATUS"
+          if [ "$STATUS" = "200" ]; then
+            echo "available=true" >> $GITHUB_OUTPUT
+          else
+            echo "available=false" >> $GITHUB_OUTPUT
+            echo "::warning::DefectDojo no accesible a través del túnel. Los reportes quedan guardados como Artifacts en GitHub."
+          fi
+
+      - name: Import Semgrep Report to DefectDojo
+        if: steps.check_dd.outputs.available == 'true' && hashFiles('all-reports/sast-sca-reports/semgrep.json') != ''
+        run: |
+          curl -s -X POST "${{ secrets.DEFECTDOJO_URL }}/api/v2/import-scan/" \
+            -H "Authorization: Token ${{ secrets.DEFECTDOJO_TOKEN }}" \
+            -F "scan_type=Semgrep JSON Report" \
+            -F "file=@all-reports/sast-sca-reports/semgrep.json" \
+            -F "product_name=OWASP NodeGoat" \
+            -F "product_type_name=Research and Development" \
+            -F "engagement_name=CI/CD DevSecOps Pipeline" \
+            -F "auto_create_context=true" \
+            -F "close_old_findings=true"
+
+      - name: Import Dependency-Check Report to DefectDojo
+        if: steps.check_dd.outputs.available == 'true' && hashFiles('all-reports/sast-sca-reports/dependency-check-report.xml') != ''
+        run: |
+          curl -s -X POST "${{ secrets.DEFECTDOJO_URL }}/api/v2/import-scan/" \
+            -H "Authorization: Token ${{ secrets.DEFECTDOJO_TOKEN }}" \
+            -F "scan_type=Dependency Check Scan" \
+            -F "file=@all-reports/sast-sca-reports/dependency-check-report.xml" \
+            -F "product_name=OWASP NodeGoat" \
+            -F "product_type_name=Research and Development" \
+            -F "engagement_name=CI/CD DevSecOps Pipeline" \
+            -F "auto_create_context=true" \
+            -F "close_old_findings=true"
+
+      - name: Import Trivy Container & IaC Reports to DefectDojo
+        if: steps.check_dd.outputs.available == 'true'
+        run: |
+          for file in all-reports/trivy-reports/*.json; do
+            if [ -f "$file" ]; then
+              curl -s -X POST "${{ secrets.DEFECTDOJO_URL }}/api/v2/import-scan/" \
+                -H "Authorization: Token ${{ secrets.DEFECTDOJO_TOKEN }}" \
+                -F "scan_type=Trivy Scan" \
+                -F "file=@$file" \
+                -F "product_name=OWASP NodeGoat" \
+                -F "product_type_name=Research and Development" \
+                -F "engagement_name=CI/CD DevSecOps Pipeline" \
+                -F "auto_create_context=true"
+            fi
+          done
+
+      - name: Import OWASP ZAP Report to DefectDojo
+        if: steps.check_dd.outputs.available == 'true' && hashFiles('all-reports/dast-reports/zap-report.xml') != ''
+        run: |
+          curl -s -X POST "${{ secrets.DEFECTDOJO_URL }}/api/v2/import-scan/" \
+            -H "Authorization: Token ${{ secrets.DEFECTDOJO_TOKEN }}" \
+            -F "scan_type=ZAP Scan" \
+            -F "file=@all-reports/dast-reports/zap-report.xml" \
+            -F "product_name=OWASP NodeGoat" \
+            -F "product_type_name=Research and Development" \
+            -F "engagement_name=CI/CD DevSecOps Pipeline" \
+            -F "auto_create_context=true" \
+            -F "close_old_findings=true"

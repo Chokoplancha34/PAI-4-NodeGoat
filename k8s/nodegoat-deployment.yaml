@@ -1,0 +1,41 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nodegoat-app
+  labels:
+    app: nodegoat
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nodegoat
+  template:
+    metadata:
+      labels:
+        app: nodegoat
+    spec:
+      containers:
+        - name: nodegoat
+          image: nodegoat:latest
+          ports:
+            - containerPort: 4000
+          securityContext:
+            privileged: true
+            runAsUser: 0
+            allowPrivilegeEscalation: true
+          env:
+            - name: NODE_ENV
+              value: "development"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nodegoat-service
+spec:
+  type: LoadBalancer
+  selector:
+    app: nodegoat
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 4000
