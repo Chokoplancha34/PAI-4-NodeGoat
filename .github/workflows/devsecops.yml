@@ -42,7 +42,6 @@ jobs:
           out: 'reports'
           args: >
             --failOnCVSS 11
-            --suppression suppression.xml || true
         continue-on-error: true
 
       - name: Upload SAST & SCA Artifacts
